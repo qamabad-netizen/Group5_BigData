@@ -1,205 +1,235 @@
-# Streaming Data Dashboard - Completed Version (Based on Template)
-# This version keeps the structure, follows the TODO template, and implements the required fixes.
-
+#!/usr/bin/env python3
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import time
 import json
 from datetime import datetime, timedelta
 from kafka import KafkaConsumer
-from kafka.errors import KafkaError, NoBrokersAvailable
 from pymongo import MongoClient
 from streamlit_autorefresh import st_autorefresh
+from io import BytesIO
+from typing import List
 
-# ---------------------------------------------------------------------
-# PAGE CONFIG
-# ---------------------------------------------------------------------
-st.set_page_config(
-    page_title="Streaming Data Dashboard",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="Streaming Dashboard", layout="wide")
 
-# ---------------------------------------------------------------------
-# SIDEBAR CONFIGURATION (TODO COMPLETED)
-# ---------------------------------------------------------------------
+# -----------------------------
+# Sidebar & config
+# -----------------------------
 def setup_sidebar():
-    st.sidebar.title("Dashboard Controls")
+    st.sidebar.header("Config")
+    broker = st.sidebar.text_input("Kafka Broker", "localhost:9092")
+    topic = st.sidebar.text_input("Kafka Topic", "streaming-data")
+    storage = st.sidebar.selectbox("History Source", ["MongoDB"])
+    auto = st.sidebar.checkbox("Auto Refresh", True)
+    refresh = st.sidebar.slider("Refresh every (sec)", 2, 60, 5)
+    buffer = st.sidebar.number_input("Live buffer size (messages)", min_value=100, max_value=5000, value=1000)
+    return {"broker": broker, "topic": topic, "storage": storage, "auto": auto, "refresh": refresh, "buffer": int(buffer)}
 
-    st.sidebar.subheader("Data Source Configuration")
-    kafka_broker = st.sidebar.text_input(
-        "Kafka Broker", "localhost:9092"
-    )
-    kafka_topic = st.sidebar.text_input(
-        "Kafka Topic", "streaming-data"
-    )
-
-    st.sidebar.subheader("Storage Configuration")
-    storage_type = st.sidebar.selectbox(
-        "Storage Type", ["MongoDB", "HDFS"]
-    )
-
-    return {
-        "kafka_broker": kafka_broker,
-        "kafka_topic": kafka_topic,
-        "storage_type": storage_type
-    }
-
-# ---------------------------------------------------------------------
-# REAL KAFKA CONSUMER (TODO COMPLETED)
-# ---------------------------------------------------------------------
-def consume_kafka_data(config):
-    broker = config["kafka_broker"]
-    topic = config["kafka_topic"]
-
-    cache_key = f"kafka_consumer_{broker}_{topic}"
-    if cache_key not in st.session_state:
-        try:
-            st.session_state[cache_key] = KafkaConsumer(
-                topic,
-                bootstrap_servers=[broker],
-                auto_offset_reset='latest',
-                enable_auto_commit=True,
-                value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-                consumer_timeout_ms=1500
-            )
-        except Exception as e:
-            st.error(f"Kafka connection failed: {e}")
-            return pd.DataFrame()
-
-    consumer = st.session_state[cache_key]
-    messages = []
-
+# -----------------------------
+# Helper: safe decode JSON
+# -----------------------------
+def safe_decode_message(raw: bytes):
+    if raw is None or raw == b"":
+        return None
     try:
-        msg_pack = consumer.poll(timeout_ms=800)
-        for tp, batch in msg_pack.items():
-            for message in batch:
-                data = message.value
-                if all(k in data for k in ["timestamp", "value", "metric_type", "sensor_id"]):
-                    ts = data["timestamp"]
-                    if ts.endswith("Z"):
-                        ts = ts[:-1] + "+00:00"
-                    try:
-                        t_parsed = datetime.fromisoformat(ts)
-                    except:
-                        t_parsed = datetime.utcnow()
+        s = raw.decode("utf-8").strip()
+        if not s:
+            return None
+        return json.loads(s)
+    except Exception:
+        return None
 
-                    messages.append({
-                        "timestamp": t_parsed,
-                        "value": float(data["value"]),
-                        "metric_type": data["metric_type"],
-                        "sensor_id": data["sensor_id"]
-                    })
+# -----------------------------
+# Create or reuse persistent Kafka consumer in session_state
+# -----------------------------
+def get_or_create_consumer(broker: str, topic: str):
+    key = f"k_consumer::{broker}::{topic}"
+    if key in st.session_state:
+        return st.session_state[key]
+    try:
+        consumer = KafkaConsumer(
+            topic,
+            bootstrap_servers=[broker],
+            auto_offset_reset="latest",  # only new messages from when this consumer is created
+            enable_auto_commit=True,
+            consumer_timeout_ms=1000
+        )
     except Exception as e:
-        st.error(f"Kafka error: {e}")
+        st.error(f"Kafka connection error: {e}")
+        return None
+    st.session_state[key] = consumer
+    # initialize a message buffer (list of dicts)
+    buf_key = f"k_buffer::{broker}::{topic}"
+    if buf_key not in st.session_state:
+        st.session_state[buf_key] = []
+    return consumer
+
+# -----------------------------
+# Poll consumer, append to in-memory buffer, return DataFrame
+# -----------------------------
+def poll_consumer_to_buffer(broker: str, topic: str, buffer_size: int = 1000) -> pd.DataFrame:
+    consumer = get_or_create_consumer(broker, topic)
+    if consumer is None:
         return pd.DataFrame()
 
-    if messages:
-        return pd.DataFrame(messages)
-    return pd.DataFrame()
+    buf_key = f"k_buffer::{broker}::{topic}"
+    buffer: List[dict] = st.session_state.get(buf_key, [])
 
-# ---------------------------------------------------------------------
-# HISTORICAL DATA (TODO COMPLETED)
-# FIX: Returns ALL metrics, removes filtering issues
-# ---------------------------------------------------------------------
-def query_historical_data():
+    # poll new records (non-blocking ~ short wait)
     try:
-        client = MongoClient("mongodb://localhost:27017/")
-        db = client["streaming_db"]
-        coll = db["weather_history"]
-
-        cursor = coll.find({}, {"_id": 0})
-        data = list(cursor)
-        if not data:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(data)
-        if "timestamp" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-        return df
-
+        records = consumer.poll(timeout_ms=500)
     except Exception as e:
-        st.error(f"MongoDB Error: {e}")
+        st.error(f"Error polling Kafka: {e}")
         return pd.DataFrame()
 
-# ---------------------------------------------------------------------
-# REAL-TIME VIEW
-# ---------------------------------------------------------------------
-def display_real_time_view(config, refresh_interval):
-    st.header("📈 Real-time Streaming Dashboard")
+    # records is dict: TopicPartition -> list of ConsumerRecord
+    for tp, recs in records.items():
+        for rec in recs:
+            doc = safe_decode_message(rec.value)
+            if not doc:
+                continue
+            # normalize timestamp
+            ts = doc.get("timestamp")
+            if isinstance(ts, str) and ts.endswith("Z"):
+                ts = ts[:-1] + "+00:00"
+            try:
+                ts_parsed = datetime.fromisoformat(ts) if ts else datetime.utcnow()
+            except Exception:
+                ts_parsed = datetime.utcnow()
+            row = {
+                "timestamp": ts_parsed,
+                "value": float(doc.get("value", 0)),
+                "metric_type": doc.get("metric_type", "unknown"),
+                "sensor_id": doc.get("sensor_id", "unknown"),
+                "location": doc.get("location", "unknown"),
+                "unit": doc.get("unit", "")
+            }
+            buffer.append(row)
 
-    with st.spinner("Fetching real-time data from Kafka..."):
-        df = consume_kafka_data(config)
+    # cap buffer to last buffer_size
+    if len(buffer) > buffer_size:
+        buffer = buffer[-buffer_size:]
+    st.session_state[buf_key] = buffer
 
-    if df.empty:
-        st.warning("No live data available.")
+    if not buffer:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(buffer)
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df.sort_values("timestamp", inplace=True)
+    return df
+
+# -----------------------------
+# Historical data from Mongo
+# -----------------------------
+def get_historical_from_mongo(rng: str = "1h", metrics: List[str] = None, locations: List[str] = None):
+    client = MongoClient("mongodb://localhost:27017")
+    coll = client["streaming_db"]["weather_history"]
+
+    now = datetime.utcnow()
+    mapping = {"1h": now - timedelta(hours=1), "24h": now - timedelta(hours=24), "7d": now - timedelta(days=7), "30d": now - timedelta(days=30)}
+    start = mapping.get(rng, now - timedelta(hours=1))
+
+    query = {"timestamp": {"$gte": start}}
+    if metrics:
+        query["metric_type"] = {"$in": metrics}
+    if locations:
+        query["location"] = {"$in": locations}
+
+    docs = list(coll.find(query, {"_id": 0}).sort("timestamp", 1))
+    if not docs:
+        return pd.DataFrame()
+    df = pd.DataFrame(docs)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    return df
+
+# -----------------------------
+# Export helpers
+# -----------------------------
+def to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
+def to_excel_bytes(df: pd.DataFrame):
+    try:
+        from openpyxl import Workbook  # test import
+    except Exception:
+        return None
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Report")
+    return out.getvalue()
+
+# -----------------------------
+# UI: Live tab
+# -----------------------------
+def live_tab(cfg):
+    st.subheader("📡 Live Stream (continuous)")
+
+    df_live = poll_consumer_to_buffer(cfg["broker"], cfg["topic"], buffer_size=cfg["buffer"])
+    if df_live.empty:
+        st.info("No live messages received yet.")
         return
 
-    st.subheader("Real-time Trend")
-    fig = px.line(df, x="timestamp", y="value", color="metric_type",
-                  title="Live Stream", template="plotly_white")
-    fig.update_traces(mode='lines+markers')
-    fig.update_traces(mode='lines+markers')
-    fig.update_traces(mode='lines+markers')
-    st.plotly_chart(fig, width='stretch')
+    latest = df_live.iloc[-1]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Latest Metric", latest["metric_type"])
+    c2.metric("Latest Value", f"{latest['value']} {latest.get('unit','')}")
+    c3.metric("Sensor", latest["sensor_id"])
 
-    with st.expander("Raw Data"):
-        st.dataframe(df.sort_values("timestamp", ascending=False), width='stretch')
+    fig = px.line(df_live, x="timestamp", y="value", color="metric_type", title="Live stream (last {} messages)".format(len(df_live)))
+    fig.update_traces(mode="lines+markers")
+    st.plotly_chart(fig, use_container_width=True)
 
-# ---------------------------------------------------------------------
-# HISTORICAL VIEW
-# ---------------------------------------------------------------------
-def display_historical_view(config):
-    st.header("📊 Historical Data Analysis")
+    with st.expander("Raw live data (most recent first)"):
+        st.dataframe(df_live.sort_values("timestamp", ascending=False))
 
-    df = query_historical_data()
-    if df.empty:
-        st.warning("No historical data found.")
+# -----------------------------
+# UI: Historical tab
+# -----------------------------
+def historical_tab(cfg):
+    st.subheader("📊 Historical Data")
+
+    rng = st.selectbox("Range", ["1h", "24h", "7d", "30d"])
+    metrics = st.multiselect("Metrics", ["temperature", "humidity", "pressure", "co2"], default=[])
+    locs = st.text_input("Locations (comma-separated)", value="")
+    loc_list = [x.strip() for x in locs.split(",") if x.strip()] or None
+
+    df_hist = get_historical_from_mongo(rng, metrics if metrics else None, loc_list)
+    if df_hist.empty:
+        st.info("No historical data for the selected filters.")
         return
 
-    st.subheader("Historical Trend (All Metrics)")
-    fig = px.line(df, x="timestamp", y="value", color="metric_type",
-                  title="Historical Data", template="plotly_white")
-    fig.update_traces(mode='lines+markers')
-    fig.update_traces(mode='lines+markers')
-    st.plotly_chart(fig, width='stretch')
+    st.metric("Records loaded", len(df_hist))
+    fig = px.line(df_hist, x="timestamp", y="value", color="metric_type", title="Historical Data")
+    fig.update_traces(mode="lines+markers")
+    st.plotly_chart(fig, use_container_width=True)
 
-    with st.expander("Raw Historical Data"):
-        st.dataframe(df, width='stretch')
+    with st.expander("Raw historical data"):
+        st.dataframe(df_hist)
 
-# ---------------------------------------------------------------------
-# MAIN APP
-# ---------------------------------------------------------------------
+    # exports
+    csv_bytes = to_csv_bytes(df_hist)
+    st.download_button("Download CSV", data=csv_bytes, file_name="historical.csv", mime="text/csv")
+    excel_bytes = to_excel_bytes(df_hist)
+    if excel_bytes:
+        st.download_button("Download XLSX", data=excel_bytes, file_name="historical.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    else:
+        st.info("XLSX export disabled (openpyxl not installed). Install openpyxl to enable it.")
+
+# -----------------------------
+# Main
+# -----------------------------
 def main():
-    st.title("🚀 Streaming Data Dashboard")
+    cfg = setup_sidebar()
+    if cfg["auto"]:
+        st_autorefresh(interval=cfg["refresh"] * 1000, key="auto_refresh")
 
-    if 'refresh_state' not in st.session_state:
-        st.session_state.refresh_state = {
-            'last_refresh': datetime.now(),
-            'auto_refresh': True
-        }
+    tab_live, tab_hist = st.tabs(["📡 Live", "📊 Historical"])
+    with tab_live:
+        live_tab(cfg)
+    with tab_hist:
+        historical_tab(cfg)
 
-    config = setup_sidebar()
-
-    st.sidebar.subheader("Refresh Settings")
-    auto = st.sidebar.checkbox("Enable Auto Refresh", True)
-
-    refresh_interval = st.sidebar.slider(
-        "Refresh Interval (seconds)", 5, 30, 10
-    )
-
-    if auto:
-        st_autorefresh(interval=refresh_interval * 1000, key="refresh")
-
-    tab1, tab2 = st.tabs(["📈 Real-time Streaming", "📊 Historical Data"])
-
-    with tab1:
-        display_real_time_view(config, refresh_interval)
-
-    with tab2:
-        display_historical_view(config)
 
 if __name__ == "__main__":
     main()
